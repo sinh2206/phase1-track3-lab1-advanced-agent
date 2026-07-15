@@ -1,0 +1,221 @@
+TỔNG QUAN DỰ ÁN — LAB 16: REFLEXION AGENT
+==========================================
+
+1. Mục tiêu
+-----------
+
+Dự án triển khai pipeline hỏi đáp multi-hop có khả năng tự phản chiếu. Agent tạo
+câu trả lời, Evaluator chấm đúng/sai, Reflector phân tích lỗi và bài học được đưa
+vào lần thử tiếp theo. Mục tiêu thí nghiệm là so sánh độ chính xác với chi phí tăng
+thêm về số lượt, token và độ trễ.
+
+Dự án có hai chế độ:
+
+- mock: phản hồi xác định, không gọi mạng, dùng để hiểu flow, test và autograde.
+- llm: gọi endpoint tương thích OpenAI, gồm dịch vụ OpenAI hoặc server local như
+  Ollama; cấu hình qua biến môi trường hoặc tham số CLI.
+
+2. Kiến trúc
+------------
+
+data/*.json
+    -> load_dataset() -> list[QAExample]
+    -> ReActAgent.run() và ReflexionAgent.run()
+    -> AgentRuntime
+         -> Actor
+         -> Evaluator
+         -> Reflector nếu sai và còn lượt
+    -> AttemptTrace -> RunRecord
+    -> react_runs.jsonl + reflexion_runs.jsonl
+    -> build_report() -> report.json + report.md
+    -> autograde.py
+
+Vai trò:
+
+- Actor chỉ nhận question, context và reflection memory; không nhận gold answer.
+- Evaluator nhận gold answer để chấm semantic correctness, trả score 0/1, lý do,
+  bằng chứng thiếu, phát biểu thừa và failure mode.
+- Reflector nhận câu trả lời sai cùng feedback, tạo lesson và next strategy.
+- Runtime đóng gói backend và metric để agent loop không phụ thuộc nhà cung cấp.
+
+ReActAgent trong bài là baseline một lượt (`max_attempts = 1`), không phải ReAct
+đầy đủ có Thought/Action/Observation và công cụ. ReflexionAgent dùng tối đa ba lượt
+mặc định; nó dừng ngay khi đúng hoặc khi hết lượt.
+
+3. Luồng Reflexion
+------------------
+
+Mỗi lượt thực hiện theo thứ tự:
+
+1. Actor trả ActorOutput có final answer.
+2. Evaluator trả JudgeResult đã được Pydantic validate.
+3. Nếu score = 1, agent ghi trace và dừng.
+4. Nếu sai, là Reflexion và vẫn còn lượt, Reflector tạo ReflectionEntry.
+5. Lesson và next strategy được thêm vào reflection_memory.
+6. Lượt sau Actor nhận memory mới và đổi chiến thuật.
+
+Reflection không được gọi ở lần cuối vì không còn lượt để sử dụng memory. Mỗi
+AttemptTrace chỉ được ghi một lần và bao gồm metric của mọi lời gọi phát sinh trong
+lượt đó.
+
+4. Thành phần dự án
+------------------
+
+README.md
+    Hướng dẫn cài đặt, cấu hình mock/LLM, lệnh benchmark, định dạng dữ liệu, đầu
+    ra, test, rubric và danh sách thành phần.
+
+requirements.txt
+    Khai báo Pydantic, Typer, Rich, Pandas, python-dotenv, OpenAI SDK và Pytest.
+    OpenAI SDK cũng dùng được với endpoint local có API tương thích.
+
+.env.example
+    Mẫu cấu hình LLM_MODEL, API key, base URL, timeout và JSON mode. Tệp `.env`
+    thật không được commit.
+
+.gitignore
+    Loại môi trường ảo, secret, cache Python/Pytest và output benchmark khỏi Git.
+
+run_benchmark.py
+    CLI nạp dataset, chọn MockRuntime hoặc LLMRuntime, dùng cùng runtime cho hai
+    agent, ghi hai JSONL, tạo report và in summary. Tham số gồm dataset, out_dir,
+    reflexion_attempts, mode, model, base_url và temperature.
+
+autograde.py
+    Chấm report.json theo schema, độ đầy đủ thí nghiệm, độ sâu phân tích và bonus.
+    Script chỉ kiểm tra cấu trúc/số lượng; chất lượng reasoning, dữ liệu và phép đo
+    vẫn cần review thủ công.
+
+data/hotpot_mini.json
+    Tám câu hỏi mẫu tiếng Anh. Mock cố tình trả sai hp2, hp4, hp6, hp8 ở baseline,
+    tạo ba lỗi: incomplete_multi_hop, wrong_final_answer và entity_drift.
+
+data/multihop_100.json
+    Tập chính gồm đúng 100 QAExample: tám câu gốc và 92 câu tự chứa. Các chuỗi 2–3
+    hop bao phủ tác giả–trường học, người–nơi sinh–sông, thủ đô–quốc gia–biển,
+    địa danh–tiền tệ, tác phẩm–nhạc cụ, lễ hội–thành phố–châu lục,
+    công ty–nhà sáng lập–quê quán–thủ đô và núi–quốc gia–tiền tệ.
+
+src/reflexion_lab/__init__.py
+    Đánh dấu thư mục là package Python.
+
+src/reflexion_lab/schemas.py
+    Định nghĩa và validate:
+
+    - ContextChunk: title, text.
+    - QAExample: qid, difficulty, question, gold_answer, context.
+    - ActorOutput: answer không rỗng.
+    - JudgeResult: score 0/1, reason, evidence, claims, failure_mode; validator giữ
+      score và failure mode nhất quán.
+    - ReflectionEntry: attempt_id dương, failure_reason, lesson, next_strategy.
+    - AttemptTrace: kết quả/metric/reflection của một lượt.
+    - RunRecord: kết quả cuối, tổng metric và toàn bộ lịch sử.
+    - ReportPayload: sáu phần bắt buộc của báo cáo.
+    - ReflexionState: TypedDict dự phòng cho workflow stateful mở rộng.
+
+src/reflexion_lab/runtime.py
+    Chứa CallResult generic và AgentRuntime Protocol. CallResult mang value, token,
+    latency và cờ token có phải estimate hay không.
+
+src/reflexion_lab/mock_runtime.py
+    Giữ ba hàm mock đơn giản và cung cấp MockRuntime theo Protocol. Actor sai sẽ
+    tiếp tục sai nếu memory rỗng, nên kết quả phục hồi thực sự phụ thuộc loop đã
+    gọi Reflector. Metric mock là ước lượng cố định để kết quả tái lập.
+
+src/reflexion_lab/llm_runtime.py
+    Đọc `.env`, tạo OpenAI client, dựng input cho ba vai trò, gọi chat completions,
+    làm sạch code fence, validate JSON bằng Pydantic và retry tối đa hai lần. Usage
+    của provider được ưu tiên; nếu thiếu thì token được ước lượng và đánh dấu.
+    Latency được đo bằng `time.perf_counter()`.
+
+src/reflexion_lab/prompts.py
+    Ba system prompt đã hoàn thiện. Actor bị giới hạn vào context; Evaluator có
+    output JSON và taxonomy lỗi; Reflector phải tạo bài học có thể hành động. Cả
+    ba đều yêu cầu bỏ qua instruction nằm trong context để giảm prompt injection.
+
+src/reflexion_lab/agents.py
+    BaseAgent triển khai loop, điều kiện dừng, reflection memory, trace và phép cộng
+    metric. ReActAgent/ReflexionAgent chỉ cấu hình loại agent và số lượt.
+
+src/reflexion_lab/utils.py
+    normalize_answer() chuẩn hóa NFKC, giữ Unicode, bỏ dấu câu/mạo từ tiếng Anh và
+    chuẩn hóa khoảng trắng. load_dataset() kiểm tra mảng không rỗng, schema và qid
+    trùng. save_jsonl() ghi RunRecord bằng UTF-8.
+
+src/reflexion_lab/reporting.py
+    Tính EM, avg attempts/token/latency, tỷ lệ token estimate và delta. Failure mode
+    được nhóm theo loại lỗi ở cấp cao nhất rồi tách count theo agent, phù hợp cách
+    autograder đếm. Discussion được tạo từ kết quả thật và report JSON giữ Unicode.
+
+tests/
+    test_utils.py kiểm tra normalize Unicode và qid trùng; test_schemas.py kiểm tra
+    validation; test_agents.py kiểm tra baseline, memory, dừng sớm và tổng metric;
+    test_reporting.py kiểm tra sáu khóa báo cáo, hai agent và ba failure mode.
+
+Overview.txt, knowledge.txt, Note.txt
+    Lần lượt mô tả tổng quan, kiến thức nền và quy trình triển khai/kiểm tra.
+
+5. Đầu vào và đầu ra
+-------------------
+
+Mỗi phần tử dataset:
+
+{
+  "qid": "id_duy_nhat",
+  "difficulty": "easy | medium | hard",
+  "question": "Câu hỏi nhiều bước",
+  "gold_answer": "Đáp án chuẩn",
+  "context": [{"title": "Nguồn", "text": "Bằng chứng"}]
+}
+
+Với N câu hỏi, pipeline tạo 2N RunRecord và 2N mục trong `examples`. Tập 100 mẫu
+tạo 200 record, vượt ngưỡng 100 record và 20 example của autograder.
+
+Đầu ra trong out_dir:
+
+- react_runs.jsonl và reflexion_runs.jsonl để audit từng lượt.
+- report.json cho chương trình chấm.
+- report.md cho người đọc.
+
+6. Metric và failure mode
+-------------------------
+
+- EM: trung bình `is_correct` của từng agent.
+- Avg attempts: số lượt trung bình.
+- Avg token: tổng token trung bình mỗi RunRecord.
+- Avg latency: tổng ms trung bình mỗi RunRecord.
+- Delta: Reflexion trừ ReAct cho bốn metric chính.
+- token_estimate_rate: tỷ lệ record không có usage thật từ provider.
+
+Failure mode hợp lệ: entity_drift, incomplete_multi_hop, wrong_final_answer,
+looping và reflection_overfit. Kết quả đúng dùng `none` nhưng `none` không được tính
+như một lỗi trong failure breakdown.
+
+7. Rubric
+---------
+
+- 30 điểm schema: đủ meta, summary, failure_modes, examples, extensions,
+  discussion.
+- 30 điểm experiment: có ReAct/Reflexion, ít nhất 100 records, ít nhất 20 examples.
+- 20 điểm analysis: ít nhất ba failure mode và discussion ít nhất 250 ký tự.
+- 20 điểm bonus: tối đa hai extension được autograder nhận diện.
+
+Extension đã triển khai: structured_evaluator, reflection_memory,
+benchmark_report_json và mock_mode_for_autograding.
+
+8. Trạng thái và giới hạn
+-------------------------
+
+Các TODO cốt lõi trong scaffold đã được hoàn thiện ở mức mã nguồn. Chưa có kết quả
+thực thi trong repo vì test, benchmark và autograde được để người dùng tự chạy.
+
+Các giới hạn cần hiểu khi đọc kết quả:
+
+- LLM-as-a-judge có thể thiên lệch; nên kiểm tra thủ công một tập nhỏ.
+- 92 mẫu bổ sung là dữ liệu tổng hợp tự chứa, phù hợp kiểm tra flow nhưng không
+  thay thế hoàn toàn benchmark tự nhiên như HotpotQA.
+- Provider không trả usage sẽ khiến token là estimate, dù latency vẫn được đo.
+- Endpoint không hỗ trợ JSON response_format cần đặt LLM_JSON_MODE=false.
+- Reflection nhận feedback của Evaluator; prompt đã hạn chế rò rỉ đáp án nhưng
+  chất lượng/công bằng còn phụ thuộc nội dung model sinh ra.
+- Golden test cần lưu ở out_dir riêng và không dùng để chỉnh prompt trước khi chấm.

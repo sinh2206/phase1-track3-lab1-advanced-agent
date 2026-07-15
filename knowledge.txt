@@ -1,0 +1,149 @@
+KIẾN THỨC CẦN CÓ CHO BÀI TẬP REFLEXION AGENT
+============================================
+
+1. Python nền tảng
+------------------
+
+- Module/package, import tương đối và cách chạy script từ thư mục gốc dự án.
+- Hàm, class, kế thừa, `@dataclass` và constructor `super()`.
+- Vòng lặp, comprehension, điều kiện dừng và quản lý state qua nhiều lần thử.
+- Type hint: `list`, `dict`, `Literal`, `Optional`, `TypedDict` và union `str | Path`.
+- `pathlib.Path`, context manager, đọc/ghi tệp với encoding UTF-8.
+- Xử lý ngoại lệ để quản lý lỗi API, lỗi parse JSON và dữ liệu không hợp lệ.
+
+2. Pydantic 2 và structured output
+----------------------------------
+
+Cần hiểu:
+
+- `BaseModel` dùng để khai báo và validate cấu trúc dữ liệu.
+- `Field(default_factory=list)` tạo list riêng cho từng instance, tránh mutable
+  default dùng chung.
+- `model_validate()` chuyển dict thành model đã kiểm tra.
+- `model_validate_json()` phù hợp để parse JSON do LLM trả về.
+- `model_dump()` và `model_dump_json()` phục vụ ghi report/JSONL.
+- Ràng buộc score chỉ nhận 0 hoặc 1; trường bắt buộc và trường có giá trị mặc định.
+- Hành vi với extra field: schema rỗng có thể bỏ qua dữ liệu đầu vào, khiến lỗi chỉ
+  xuất hiện khi code truy cập thuộc tính không tồn tại.
+
+Các schema trọng tâm:
+
+- JudgeResult cần tối thiểu: `score`, `reason`, `missing_evidence`,
+  `spurious_claims`.
+- ReflectionEntry cần tối thiểu: `attempt_id`, `failure_reason`, `lesson`,
+  `next_strategy`.
+- AttemptTrace lưu dữ liệu của từng lượt; RunRecord lưu kết quả toàn bộ lượt.
+
+3. Agent và LLM
+---------------
+
+- System prompt xác định vai trò, luật và định dạng đầu ra ổn định.
+- User/input prompt cung cấp question, context và reflection memory cần thiết.
+- Actor sinh đáp án; Evaluator chấm; Reflector rút kinh nghiệm từ thất bại.
+- ReAct truyền thống thường lặp Reason/Act/Observe với công cụ. Baseline trong bài
+  chỉ chạy một lần, nên không nên suy diễn rằng nó là ReAct đầy đủ.
+- Reflexion là vòng phản hồi bằng ngôn ngữ: thử -> đánh giá -> phản chiếu -> thử
+  lại. Reflection phải thay đổi chiến thuật, không chỉ diễn đạt lại lỗi.
+- Điều kiện dừng gồm: score bằng 1 hoặc đã đạt `max_attempts`.
+- Memory phải được đưa lại cho Actor; nếu chỉ lưu mà không dùng thì không tạo ra
+  tác dụng.
+
+4. Multi-hop question answering
+-------------------------------
+
+Câu hỏi HotpotQA cần kết nối ít nhất hai mẩu thông tin. Ví dụ:
+
+Ada Lovelace -> sinh tại London -> River Thames chảy qua London.
+
+Agent dễ mắc các lỗi:
+
+- incomplete_multi_hop: dừng ở thực thể trung gian, chưa hoàn tất bước hai.
+- entity_drift: chuyển sang thực thể không được bằng chứng hỗ trợ.
+- wrong_final_answer: suy luận có vẻ đúng nhưng chọn sai đáp án cuối.
+- looping: lặp lại chiến thuật/câu trả lời cũ qua nhiều lần.
+- reflection_overfit: reflection quá phụ thuộc một mẫu và làm giảm khả năng tổng quát.
+
+Cần phân biệt reasoning nội bộ với final answer ngắn gọn, đồng thời buộc mọi kết
+luận dựa trên context thay vì kiến thức ngoài hoặc gold answer.
+
+5. Prompt engineering
+---------------------
+
+- Nêu rõ nhiệm vụ, nguồn dữ liệu được phép dùng và tiêu chí hoàn thành.
+- Yêu cầu Evaluator/Reflector trả đúng JSON tương ứng schema, không kèm Markdown.
+- Cho Actor biết cách sử dụng reflection memory nhưng không cung cấp gold_answer.
+- Yêu cầu Evaluator chấp nhận cách diễn đạt tương đương hợp lý, không chỉ so chuỗi
+  máy móc nếu mục tiêu là semantic evaluation.
+- Reflection cần chỉ ra lỗi, bằng chứng còn thiếu, bài học tổng quát và hành động
+  cụ thể ở lượt sau; tránh tiết lộ trực tiếp đáp án chuẩn cho Actor.
+- Dùng temperature thấp và cấu hình cố định khi cần benchmark có khả năng tái lập.
+
+6. Tích hợp một LLM thật
+------------------------
+
+Cần biết cách dùng SDK/API của nhà cung cấp đã chọn, chẳng hạn Ollama, vLLM,
+OpenAI hoặc Gemini:
+
+- Quản lý model name, base URL và API key bằng biến môi trường/.env.
+- Gửi system message và input message; lấy text hoặc structured output.
+- Parse/validate output, retry có giới hạn khi JSON sai định dạng.
+- Xử lý timeout, rate limit, lỗi mạng và lỗi nhà cung cấp.
+- Ghi nhận input token, output token và tổng token từ response usage.
+- Đo latency bằng đồng hồ đơn điệu (`time.perf_counter`) và quy đổi sang ms.
+- Không commit API key, dữ liệu nhạy cảm hoặc log chứa secret.
+- Theo dõi chi phí: Reflexion dùng thêm Evaluator, Reflector và nhiều lượt Actor.
+
+Repo đã khai báo OpenAI SDK để dùng OpenAI-compatible API. Nếu chọn một backend
+không tương thích, cần thay SDK tương ứng và khóa phiên bản.
+
+7. Đánh giá mô hình
+-------------------
+
+- Exact Match (EM): tỷ lệ dự đoán khớp đáp án sau chuẩn hóa.
+- Accuracy trong scaffold tương đương trung bình của `is_correct`.
+- Avg attempts: số lượt trung bình; thấp hơn thường rẻ và nhanh hơn.
+- Token và latency: đo chi phí chất lượng; cần tính cả các lời gọi Actor,
+  Evaluator và Reflector nếu muốn so sánh công bằng.
+- Delta Reflexion - ReAct: cho biết lợi ích hoặc chi phí tăng thêm của Reflexion.
+- Failure analysis: nhóm lỗi, đếm tần suất, lấy ví dụ và giải thích nguyên nhân.
+- Evaluator bias: LLM-as-a-judge có thể chấm không ổn định hoặc thiên lệch; nên có
+  một tập nhỏ được con người kiểm tra để hiệu chuẩn.
+
+`normalize_answer()` đã chuẩn hóa NFKC và giữ ký tự Unicode. Khi dùng dữ liệu tiếng
+Việt vẫn cần kiểm thử riêng quy tắc dấu câu, tên riêng và đáp án tương đương.
+
+8. Dữ liệu JSON và JSONL
+------------------------
+
+- JSON dataset là một mảng các QAExample.
+- JSONL lưu một object trên mỗi dòng, thuận tiện đọc tuần tự và phân tích run.
+- Mọi tệp cần đọc/ghi bằng UTF-8.
+- qid phải duy nhất; difficulty chỉ được là easy/medium/hard; context phải đủ bằng
+  chứng để suy ra đáp án.
+- Dữ liệu benchmark cần đa dạng độ khó, loại quan hệ và thứ tự bằng chứng.
+- Không dùng tập benchmark để tinh chỉnh prompt quá mức; nên tách tập phát triển
+  và tập đánh giá/golden test.
+
+9. CLI, báo cáo và kiểm thử
+--------------------------
+
+- Typer ánh xạ tham số hàm thành tùy chọn CLI; Rich định dạng thông báo terminal.
+- Pytest dùng test discovery và assertion; dependency đã có trong requirements.txt.
+- Unit test nên bao phủ schema, normalize, điều kiện dừng, memory và report.
+- Integration test nên dùng fake/mock backend để không tốn API và cho kết quả ổn
+  định; test LLM thật nên được tách riêng.
+- Cần hiểu autograde.py chấm cấu trúc report, không chứng minh chất lượng suy luận.
+
+10. Kiến thức mở rộng cho phần bonus
+------------------------------------
+
+- structured_evaluator: ép/validate output chấm điểm theo schema.
+- reflection_memory: quản lý và đưa bài học cũ vào lần thử sau.
+- adaptive_max_attempts: chọn số lượt theo độ khó hoặc độ tin cậy.
+- memory_compression: tóm tắt memory để giảm token và nhiễu.
+- mini_lats_branching: thử nhiều nhánh suy luận rồi chọn ứng viên tốt.
+- plan_then_execute: lập kế hoạch các hop trước khi trả lời.
+- benchmark_report_json: báo cáo máy đọc được và có schema ổn định.
+- mock_mode_for_autograding: giữ backend xác định để test không phụ thuộc API.
+
+Nên ưu tiên flow đúng, dữ liệu đáng tin và phép đo thật trước khi làm extension.

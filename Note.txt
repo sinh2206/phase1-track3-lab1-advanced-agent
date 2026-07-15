@@ -1,0 +1,290 @@
+CÁCH THỰC HIỆN DỰ ÁN — REFLEXION AGENT
+======================================
+
+Tài liệu này mô tả thứ tự triển khai đề xuất. Các lệnh ở cuối chỉ là hướng dẫn;
+người học tự chạy và kiểm tra kết quả.
+
+1. Chuẩn bị môi trường
+---------------------
+
+Từ thư mục gốc dự án:
+
+    python -m venv .venv
+
+PowerShell:
+
+    .\.venv\Scripts\Activate.ps1
+    python -m pip install -r requirements.txt
+
+Requirements đã gồm Pytest và OpenAI SDK. Khi chọn backend không tương thích
+OpenAI API, bổ sung SDK tương ứng và khóa phiên bản. Lưu API key trong biến môi
+trường/.env, tuyệt đối không ghi trực tiếp vào source code.
+
+2. Hiểu baseline trước khi sửa
+------------------------------
+
+Đọc theo thứ tự:
+
+    schemas.py -> mock_runtime.py -> agents.py -> reporting.py
+    -> run_benchmark.py -> autograde.py
+
+Theo dõi một QAExample từ dataset qua Actor, Evaluator, AttemptTrace, RunRecord và
+report. Ghi nhớ rằng mock runtime biết gold answer và cố tình tạo lỗi; nó chỉ kiểm
+tra pipeline. Baseline mang tên ReAct trong repo thực tế chỉ có một lần trả lời.
+
+3. Schema đã triển khai
+-----------------------
+
+Trong `src/reflexion_lab/schemas.py`, hai schema cốt lõi được định nghĩa như sau:
+
+    class JudgeResult(BaseModel):
+        score: int = Field(ge=0, le=1)
+        reason: str
+        missing_evidence: list[str] = Field(default_factory=list)
+        spurious_claims: list[str] = Field(default_factory=list)
+
+    class ReflectionEntry(BaseModel):
+        attempt_id: int
+        failure_reason: str
+        lesson: str
+        next_strategy: str
+
+Implementation còn ràng buộc `attempt_id >= 1`, chuỗi không rỗng và tự giữ score
+nhất quán với failure_mode. Test kiểm tra score ngoài 0/1 và attempt không hợp lệ.
+
+4. Ba system prompt đã triển khai
+---------------------------------
+
+ACTOR_SYSTEM nên:
+
+- Chỉ dùng context và reflection memory, không thấy gold answer.
+- Xác định đầy đủ các hop và kiểm chứng thực thể cuối.
+- Trả final answer ngắn, đúng định dạng mà runtime dễ parse.
+
+EVALUATOR_SYSTEM nên:
+
+- Nhận question, gold answer và predicted answer.
+- Chấm score đúng 0/1, giải thích ngắn gọn.
+- Trả duy nhất JSON có `score`, `reason`, `missing_evidence`,
+  `spurious_claims`; không thêm code fence.
+
+REFLECTOR_SYSTEM nên:
+
+- Nhận question, context, câu trả lời sai, lý do chấm và lịch sử cần thiết.
+- Chỉ rõ lỗi nằm ở hop nào và bằng chứng nào bị bỏ qua.
+- Tạo bài học có thể tái sử dụng và next_strategy cụ thể cho lượt sau.
+- Trả duy nhất JSON khớp ReflectionEntry; không lặp vô ích hay tiết lộ đáp án.
+
+Prompt nên có ranh giới rõ cho từng khối dữ liệu để nội dung trong context không
+bị hiểu nhầm là chỉ dẫn hệ thống.
+
+5. Vòng Reflexion đã triển khai
+------------------------------
+
+BaseAgent.run() hiện thực hiện logic theo thứ tự sau:
+
+1. Actor sinh answer từ question, context và reflection_memory hiện tại.
+2. Evaluator trả JudgeResult.
+3. Tạo trace và cập nhật final_answer/final_score.
+4. Nếu đúng, thêm trace một lần rồi dừng.
+5. Nếu sai, agent là `reflexion` và vẫn còn lượt:
+   - gọi reflector(example, attempt_id, judge);
+   - thêm ReflectionEntry vào `reflections`;
+   - gắn entry vào `trace.reflection`;
+   - thêm `lesson` và `next_strategy` vào reflection_memory.
+6. Thêm trace đúng một lần; tiếp tục hoặc kết thúc khi hết lượt.
+
+Không gọi Reflector cho ReActAgent hoặc sau lần thử cuối vì memory đó không còn cơ
+hội được sử dụng. Đảm bảo Actor thật sự nhận reflection_memory ở lượt kế tiếp.
+
+Một dạng pseudocode ngắn:
+
+    for attempt in attempts:
+        answer = actor(..., memory)
+        judge = evaluator(...)
+        trace = make_trace(...)
+        if judge.score == 1:
+            traces.append(trace)
+            break
+        if is_reflexion and has_next_attempt:
+            entry = reflector(...)
+            reflections.append(entry)
+            memory.append(entry.lesson + "\n" + entry.next_strategy)
+            trace.reflection = entry
+        traces.append(trace)
+
+6. Mock mode và LLM mode
+------------------------
+
+mock_runtime.py được giữ làm backend xác định; llm_runtime.py là provider riêng.
+CLI chọn `mock` hoặc `llm` và truyền runtime vào agent. Vì vậy unit test không phụ
+thuộc mạng và vẫn có thể autograde.
+
+Ba interface cần giữ ổn định:
+
+- actor_answer(...) -> str
+- evaluator(...) -> JudgeResult
+- reflector(...) -> ReflectionEntry
+
+Với LLM runtime:
+
+1. Ghép system prompt và input có cấu trúc.
+2. Gọi model với timeout và temperature phù hợp.
+3. Parse Evaluator/Reflector bằng Pydantic, retry giới hạn nếu JSON sai.
+4. Trả lỗi có ngữ cảnh khi hết retry; không âm thầm coi parse lỗi là score 0.
+5. Không gửi gold_answer cho Actor. Evaluator được phép nhận gold_answer.
+6. Tránh để lý do của Evaluator tiết lộ nguyên văn gold answer qua reflection nếu
+   muốn phép thử công bằng.
+
+Nếu dùng dependency injection cho runtime, ReAct và Reflexion có thể dùng chung
+backend mà không cần import cứng mock_runtime trong agents.py.
+
+7. Token và latency
+-------------------
+
+Implementation xử lý metric như sau:
+
+- Token: lấy prompt/input/output/total token từ metadata của provider. Xác định rõ
+  report dùng tổng token nào và dùng nhất quán.
+- Latency: đo bằng `time.perf_counter()` ngay trước/sau mỗi API call, đổi sang ms.
+- Chi phí mỗi attempt nên gồm Actor + Evaluator + Reflector phát sinh trong attempt
+  đó. Nếu provider không trả usage, ghi rõ đây là estimate và nêu cách ước lượng.
+- RunRecord là tổng của các AttemptTrace; tránh đếm thiếu reflection hoặc cộng hai
+  lần cùng một call.
+
+Nếu muốn phân tích sâu hơn, mở rộng schema để lưu token/latency riêng theo vai trò.
+
+8. Chuẩn bị dữ liệu benchmark
+-----------------------------
+
+Tạo tệp mới trong `data/`, không sửa hotpot_mini dùng cho mock. Mỗi mẫu phải có:
+
+- qid duy nhất;
+- difficulty thuộc easy/medium/hard;
+- question thực sự cần nhiều hop;
+- gold_answer rõ và nhất quán;
+- context chứa đủ bằng chứng, có thể thêm đoạn gây nhiễu hợp lý.
+
+`data/multihop_100.json` có đúng 100 QAExample. Vì mỗi mẫu chạy qua hai agent, tập
+này tạo 200 RunRecord và 200 mục `examples`. Tập gồm nhiều chuỗi 2–3 hop; khi làm
+thí nghiệm sâu hơn vẫn nên dành riêng tập phát triển prompt và tập đánh giá tự
+nhiên chưa dùng để chỉnh prompt.
+
+Trước khi benchmark, nên validate toàn bộ dataset và kiểm tra thủ công một số mẫu:
+đáp án có suy ra được từ context không, qid có trùng không, encoding có đúng UTF-8
+không và Actor có vô tình nhận gold_answer không.
+
+9. Reporting đã hoàn thiện
+--------------------------
+
+Các đầu ra cần giữ:
+
+- react_runs.jsonl và reflexion_runs.jsonl để audit từng run;
+- report.json cho autograder và phân tích tự động;
+- report.md cho người đọc.
+
+Cần sửa/kiểm tra:
+
+- `mode` phản ánh đúng mock hay LLM, không hardcode sai.
+- `num_records` bằng tổng hai nhóm agent.
+- Summary có count, EM, avg_attempts, avg_token, avg_latency và delta.
+- `examples` có ít nhất 20 mục chi tiết.
+- `discussion` dài ít nhất 250 ký tự nhưng phải phân tích kết quả thật: Reflexion
+  cải thiện dạng lỗi nào, chi phí tăng bao nhiêu, lỗi nào còn lại và giới hạn của
+  Evaluator.
+- `extensions` chỉ liệt kê tính năng đã triển khai và kiểm chứng.
+
+`failure_modes` đã dùng loại lỗi làm khóa cấp cao nhất để khớp autograde, ví dụ:
+
+    {
+      "incomplete_multi_hop": {"react": 5, "reflexion": 1},
+      "entity_drift": {"react": 4, "reflexion": 2},
+      "wrong_final_answer": {"react": 3, "reflexion": 1}
+    }
+
+Tập mock tạo ba loại lỗi thật, không cần thêm khóa giả. report.md và report.json
+dùng cùng cấu trúc này.
+
+10. Kiểm thử đã bổ sung
+-----------------------
+
+Test hiện bao phủ:
+
+- Schema chấp nhận dữ liệu đúng, từ chối score/attempt không hợp lệ.
+- ReAct chỉ chạy một attempt và không gọi Reflector.
+- Reflexion sai rồi đúng: có hai traces, một reflection và memory được dùng.
+- Reflexion đúng ngay: dừng sau một attempt, không có reflection.
+- Reflexion sai đến lượt cuối: không gọi Reflector thừa sau lượt cuối.
+- Tổng token/latency bằng tổng chi phí đã ghi.
+- Report có đủ sáu khóa bắt buộc và số record chính xác.
+- Failure breakdown có ít nhất ba loại lỗi trên fixture phù hợp.
+- LLM trả JSON lỗi: retry đúng giới hạn và phát lỗi rõ ràng.
+- Chuẩn hóa câu trả lời có test cho dấu câu, khoảng trắng và Unicode nếu dùng tiếng
+  Việt.
+
+Dùng fake runtime có bộ đếm lời gọi để test loop chính xác mà không gọi API thật.
+
+11. Làm extension sau khi core flow ổn định
+-------------------------------------------
+
+Thứ tự ít rủi ro:
+
+1. structured_evaluator: Pydantic parse + retry.
+2. reflection_memory: đã là phần cốt lõi của vòng Reflexion.
+3. benchmark_report_json và mock_mode_for_autograding.
+4. adaptive_max_attempts hoặc plan_then_execute.
+5. memory_compression/branching khi đã có phép đo token và chất lượng.
+
+Autograder chỉ tính tối đa hai extension, nhưng review thủ công có thể phát hiện
+extension chỉ được ghi tên mà chưa hoạt động. Mỗi extension nên có test và mô tả
+ảnh hưởng trong discussion.
+
+12. Thứ tự chạy đề xuất dành cho người học
+------------------------------------------
+
+Sau khi hoàn tất code, người học có thể tự chạy lần lượt:
+
+    python -m pytest
+    python run_benchmark.py --dataset data/hotpot_mini.json --out-dir outputs/sample_run
+    python autograde.py --report-path outputs/sample_run/report.json
+
+Sau đó chạy tập chính:
+
+    python run_benchmark.py --dataset data/multihop_100.json --out-dir outputs/main_run
+    python autograde.py --report-path outputs/main_run/report.json
+
+Nếu CLI được mở rộng với `--mode` hoặc `--model`, thêm chúng theo implementation.
+Không ghi đè sample_run khi cần so sánh nhiều cấu hình; đặt out_dir riêng theo
+backend, model, prompt version và seed.
+
+13. Checklist trước khi nộp
+---------------------------
+
+[x] JudgeResult và ReflectionEntry đầy đủ, có validation.
+[x] Ba system prompt không còn placeholder và output khớp schema.
+[x] Reflexion gọi Reflector đúng lúc, lưu reflection và dùng memory.
+[x] Mock mode và LLM mode được tách bằng runtime.
+[x] Token/latency lấy từ provider hoặc được đánh dấu estimate.
+[x] Actor không nhận gold_answer; secret được loại bởi .gitignore.
+[x] Dataset chính có đúng 100 mẫu đa dạng và hợp lệ về cấu trúc.
+[ ] Người dùng chạy để tạo hai JSONL cùng report.json/report.md.
+[ ] Người dùng xác nhận report thực tế có >=100 records và >=20 examples.
+[ ] Người dùng xác nhận ít nhất ba failure mode và discussion >=250 ký tự.
+[x] Extensions trong report khớp implementation và có test.
+[ ] Kết quả golden test được lưu ở thư mục riêng, không dùng để chỉnh prompt trước.
+
+14. Lỗi thường gặp
+------------------
+
+- Xóa trường schema đã định nghĩa khiến `judge.score` không tồn tại.
+- Append cùng một trace hai lần hoặc quên append trace trước khi break.
+- Gọi Reflector ở lượt cuối, làm tốn token nhưng memory không được sử dụng.
+- Có reflection list nhưng không đưa reflection_memory vào prompt của Actor.
+- Sửa mock để tự trả gold ở lượt hai dù memory rỗng, làm mất ý nghĩa test loop.
+- Chỉ tính token của Actor, bỏ Evaluator và Reflector nên so sánh chi phí sai.
+- Để mode là `mock` khi đã chạy LLM thật.
+- Tuyên bố extension trong report nhưng chưa triển khai.
+- Dùng tám mẫu mock cho báo cáo chính nên không đạt ngưỡng số lượng.
+- Giữ failure_modes theo hai agent khiến điều kiện ba khóa của autograder không đạt.
+- Thay normalization Unicode bằng regex ASCII, làm mất ký tự có dấu và sai EM.
+- Đưa API key vào source code hoặc commit tệp .env.
